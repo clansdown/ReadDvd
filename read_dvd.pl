@@ -19,11 +19,132 @@ use Fcntl 'SEEK_CUR';
 use feature 'signatures';
 use strict;
 use warnings;
+use Types::Standard qw(Int Str Num FileHandle Dict ArrayRef Optional);
 
-my ($ForceDeinterlace, $SimpleMapping, $Name, $DEST, $Help, $MinRuntimeSeconds, $Debug);
+################################################################
+# DATA STRUCTURES                                             #
+# Canonical shapes of the hashref structures this script      #
+# builds and consumes. Each `Dict` is a real Type::Tiny type  #
+# used for documentation (NOT enforced at runtime): it states #
+# the intended shape so future code builds/consumes records   #
+# consistently, and tools can check values against it.        #
+# Keep this section in sync when any structure changes.       #
+################################################################
+
+# A single open VOB file of a title. Built in read_vmg's rip loop from the
+# VTS_xx_[1-9].VOB glob; used by get_first_vob_file and read_vob_sector.
+my $VobType = Dict[
+    name    => Str,        # path of the VOB file
+    fh      => FileHandle, # open read handle
+    sectors => Num,        # file size / 2048, used to map sector -> file
+];
+
+# A sector range within one title, produced by find_all_cells and stored in a
+# RipTitle. The ripper streams sectors [start..end] (2048-byte units) to ffmpeg.
+my $FindingCellType = Dict[
+    vob_id => Int,
+    start  => Int,   # vobu_start_sector
+    end    => Int,   # last_vobu_end_sector
+];
+
+# A single cell in a program chain, parsed by read_chain (cell playback table
+# + cell position table).
+my $ChainCellType = Dict[
+    flags           => Int,
+    restricted      => Int,
+    still_time      => Int,
+    command_number  => Int,
+    playtime        => Int,      # seconds
+    playtime_text   => Str,      # HH:MM:SS:FF
+    vobu_start_sector      => Int,
+    ilvu_end_sector        => Int,
+    last_vobu_start_sector => Int,
+    last_vobu_end_sector   => Int,
+    vob_id          => Int,
+    id              => Int,
+];
+
+# A decoded program chain (PGC), parsed by read_chain.
+my $PgcType = Dict[
+    program_count => Int,
+    cell_count    => Int,
+    programs      => ArrayRef[Int],          # program map (PGC cell indexes)
+    cells         => ArrayRef[$ChainCellType],
+    playtime      => Int,
+    playtime_text => Str,
+];
+
+# One entry in a VTS program-chain table (VTS_PGCI), parsed by
+# read_vts_title_program_chain_table. index/category/offset describe where the
+# PGC lives; chain is the decoded PGC. Corrupt entries fall back to the
+# current file position (see the broken-DVD workaround there).
+my $PgciEntryType = Dict[
+    index    => Int,
+    category => Int,
+    offset   => Int,
+    chain    => $PgcType,
+];
+
+# A part-of-title (PTT) entry in a VTS title table, pointing at a program
+# within a program chain. Parsed by read_vts_title_table.
+my $PttType = Dict[
+    program_chain => Int,
+    program       => Int,
+];
+
+# One title in a VTS title table: its PTT list. Parsed by read_vts_title_table.
+my $VtsTitleType = Dict[
+    index     => Int,
+    offset    => Int,
+    ptt_count => Int,
+    ptts      => ArrayRef[$PttType],
+];
+
+# Top-level descriptor for a title on the disc, parsed by
+# read_vmg_title_table. Playing time is filled in later by read_vmg.
+my $VmgTitleType = Dict[
+    index                    => Int,
+    type                     => Int,
+    angle_count              => Int,
+    chapter_count            => Int,
+    parental_management_mask => Int,
+    video_title_set_number   => Int,
+    title_in_vts             => Int,
+    start_sector             => Int,
+    playtime                 => Optional[Int],
+];
+
+# An entry in the VTS cell address table (VTS_C_ADT), parsed by
+# read_cell_address_table. Currently parsed but not consumed downstream.
+my $CellAddressType = Dict[
+    vob_id       => Int,
+    cell_id      => Int,
+    start_sector => Int,
+    end_sector   => Int,
+];
+
+# One Video Title Set, parsed by read_vts.
+my $VtsType = Dict[
+    index          => Int,
+    titles         => ArrayRef[$VtsTitleType],
+    program_chains => ArrayRef[$PgciEntryType],
+    cell_addresses => ArrayRef[$CellAddressType],
+];
+
+# An entry in @titles_to_rip: a title selected for ripping, with the sector
+# ranges to stream to ffmpeg. Built in read_vmg's title-selection loop.
+my $RipTitleType = Dict[
+    index    => Int,
+    vts      => $VtsType,
+    cells    => ArrayRef[$FindingCellType],
+    playtime => Int,
+];
+
+my ($ForceDeinterlace, $SimpleMapping, $Name, $DEST, $Help, $MinRuntimeSeconds, $Debug, $Verbose);
 $DEST=".";
 $Name="DVD";
 $MinRuntimeSeconds = 300;
+$Verbose = 0;
 
 if(@ARGV < 1) {
     die "usage: read_dvd.pl DIR/\n";
@@ -36,7 +157,8 @@ GetOptions(
     "deinterlace|d" => \$ForceDeinterlace,
     "min-runtime|m=n" => \$MinRuntimeSeconds,
     "name|n=s" => \$Name,
-    "simple-mapping" => \$SimpleMapping
+    "simple-mapping" => \$SimpleMapping,
+    "verbose|v=n" => \$Verbose
     );
 if($Help) {
     print <<EOHELP;
@@ -49,6 +171,7 @@ Options:
     min-runtime|m=N  The minimum runtime for a title to extract and transcode, in seconds
     name|n=S         Specify the base name for videos (default is to auto-detect from the source directory)
     simple-mapping   Instead of mapping everything, take the default mapping (mostly for badly/weirdly encoded videos)
+    verbose|v=N      Set output verbosity level (0-3; higher = more detail)
 EOHELP
     exit(0);
 }
@@ -154,7 +277,23 @@ sub read_vmg {
     # Rip the titles #
     ##################
     foreach my $title (sort {int($b->{playtime}/180) <=> int($a->{playtime}/180) || $a->{index} <=> $b->{index}} @titles_to_rip) {
-        print "Saving title $title->{index}.\n";
+        my $ok = eval { rip_one_title($title); 1 };
+        if(!$ok) {
+            warn "Skipping title $title->{index}: $@";
+            next;
+        }
+    }
+}
+
+####
+# Rips a single chosen title to an AV1 MKV: opens the title's VOB files,
+# probes one with mediainfo, writes the chapter file, then either prints
+# the plan (--debug) or pipes the cell sector ranges to ffmpeg. Throws
+# (dies) if any part cannot be read, so the caller can tolerate and skip an
+# unreadable title. On an encode failure it closes the ffmpeg pipe, reaps
+# ffmpeg, and removes the truncated output before re-throwing.
+sub rip_one_title($title) {
+    print "Saving title $title->{index}.\n";
 
         # TODO: make it an option to just extract rather than to pipe to ffmpeg
         # open(my $out, ">", "title.$title->{index}.mpv") or die "Unable to open video file.$!\n";
@@ -206,6 +345,7 @@ sub read_vmg {
         my $start_time = time();
         
         my $name = "$Name.$title->{index}";
+        my $output = "$DEST/$name.av1.mkv";
         if($Debug) {
             print join(" ", "ffmpeg", "-loglevel", "30", "-stats", "-i", "-", "-i", $chapter_file, @yadif, @mapping, "-map_chapters", "1", "-c:v", "libsvtav1", "-b:v", "0", "-preset", "5", "-crf", "32", "-g", "240", "-pix_fmt", "yuv420p10le", "-svtav1-params", "tune=0", @audio, "-c:s", "copy", "${DEST}/${name}.av1.mkv", "\n");
             # Create the debug file (just a copy of the data)
@@ -221,25 +361,31 @@ sub read_vmg {
             }
 
             
-            foreach my $cell (@{$title->{cells}}) {
-                # printf("Reading cell from VOB $cell->{vob_id}.\n");
-                for(my $i = $cell->{start}; $i <= $cell->{end}; $i++) {
-                    my $data = read_vob_sector($vobs, $i);
-                    print $out $data;
+            my $ok = eval {
+                foreach my $cell (@{$title->{cells}}) {
+                    # printf("Reading cell from VOB $cell->{vob_id}.\n");
+                    for(my $i = $cell->{start}; $i <= $cell->{end}; $i++) {
+                        my $data = read_vob_sector($vobs, $i);
+                        print $out $data;
+                    }
                 }
+                foreach my $vob (@$vobs) {
+                    close($vob->{fh});
+                }
+                close($out);
+                waitpid($pid, 0);
+                1;
+            };
+            if(!$ok) {
+                close($out);
+                waitpid($pid, 0);
+                unlink($output);
+                die $@;
             }
-            
-            foreach my $vob (@$vobs) {
-                close($vob->{fh});
-            }
-            
-            close($out);
-            waitpid($pid, 0);
         }
         my $stop_time = time();
         unlink($chapter_file);
         printf("Encoding finished. Took %d seconds.\n", ($stop_time - $start_time));
-    }
 }
 
 ####
@@ -307,7 +453,12 @@ sub get_first_vob_file($title, $vobs) {
 
 ####
 # Reads a single 2048-byte VOB sector, translating the title-relative
-# sector number into the right VOB file and offset. Dies on a short read.
+# sector number into the right VOB file and seeking to that sector's byte
+# offset within the file before reading. Each call therefore returns the
+# exact sector for the given absolute sector number, independent of prior
+# reads (so callers may stream cells in any order or resume after a gap).
+# The seek is logged at verbosity level 2+. Dies on a seek failure or a
+# short read (these exceptions are caught by the caller per title).
 # Used by the ripping loop to stream cells to ffmpeg.
 sub read_vob_sector($vobs, $sector) {
     # print "read_vob_sector($vobs, $sector)\n";
@@ -325,8 +476,14 @@ sub read_vob_sector($vobs, $sector) {
         }
     }
 
+    my $byte_offset = $offset * 2048;
+    if($Verbose >= 2) {
+        print "Seeking VOB to byte $byte_offset.\n";
+    }
+
     # print "Seeking to " . ($offset*2048)."\n";
     # print "   " . seek($fh, $offset*2048, 0) . "\n";
+    seek($fh, $byte_offset, 0) or die "Unable to seek to sector $offset in VOB: $!\n";
     my $data;
     my $count = read($fh, $data, 2048);
     $count == 2048 or die "short read ($count) $!\n";
@@ -334,25 +491,35 @@ sub read_vob_sector($vobs, $sector) {
 }
 
 ####
-# checks if we've already seen the cells
+# Returns true when every cell of the title has already been seen, i.e. the
+# title is fully redundant (the "Play All" case, which is the union of the
+# individual episode titles and adds no new content). A title that only
+# shares part of its cells (e.g. a common intro segment) is not considered
+# seen and is still ripped in full.
 # @param $seen - an arrayref to the cells already seen
 # @param $cells - the cells to check
 sub already_seen($seen, $cells) {
     # print "already_seen($seen, $cells)\n";
     # print Dumper($seen);
     # TODO: implement this in a more sophisticated way, right now we're only comparing the starts and one cell could be inside of another
-    my $ret = 0;
+    my $all_seen = 1;
 
-    my $first = $cells->[0]->{start};
-    foreach my $s (@$seen) {
-        if($first == $s->{start}) {
-            $ret = 1;
+    foreach my $cell (@$cells) {
+        my $found = 0;
+        foreach my $s (@$seen) {
+            if($cell->{start} == $s->{start}) {
+                $found = 1;
+                last;
+            }
+        }
+        if(!$found) {
+            $all_seen = 0;
             last;
         }
     }
     push(@$seen, @$cells);
-    
-    return $ret;
+
+    return $all_seen;
 }
 
 ####

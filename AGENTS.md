@@ -10,10 +10,11 @@ perl read_dvd.pl [options] /path/to/dvd/
 
 - The argument is a DVD directory containing `VIDEO_TS/`; it must contain `VIDEO_TS/VIDEO_TS.IFO` (falls back to `.BUP`). There are no sample DVDs or fixtures in the repo, so the tool cannot be exercised end-to-end here.
 - Runtime binaries must be on `PATH`: `ffmpeg` (spawned via pipe-open, fed VOB data on stdin) and `mediainfo` (backticked to detect interlacing / channel count). The encode profile needs a ffmpeg with `libsvtav1` and `libopus`.
-- Non-core CPAN module required: `Devel::StackTrace` (used in the `read_*` byte helpers). Everything else (`Getopt::Long`, `Data::Dumper`, `Fcntl`, `feature`) is core.
+- Non-core CPAN modules required: `Devel::StackTrace` (used in the `read_*` byte helpers) and `Type::Tiny` + `Types::Standard` (declare the data-structure types at the top of the script; see Code quality). Everything else (`Getopt::Long`, `Data::Dumper`, `Fcntl`, `feature`) is core.
 - `--debug` prints the ffmpeg command and cell plan without encoding — the main way to sanity-check changes without a long transcode.
 - Defaults that matter: titles shorter than `--min-runtime` (default 300 s) are skipped; output is `$DEST/$Name.<title-index>.av1.mkv`; `$Name` auto-detects from the directory name (trailing `/VIDEO_TS` stripped) unless `--name` is given.
 - `Getopt::Long::Configure("bundling")` is on, so short options (`-d`, `-n`) work and long options accept single-dash forms.
+- `--verbose|v=N` sets output verbosity (0–3, default 0); per-sector seek logging in `read_vob_sector` appears at level ≥ 2.
 
 ## Verification
 
@@ -25,6 +26,8 @@ perl read_dvd.pl [options] /path/to/dvd/
 - All IFO parsing is raw binary reads with hardcoded spec offsets; VOB/cell addresses are 2048-byte sectors (`*2048`). The doc links at the top of the script (dvd.sourceforge.net/dvdinfo, wikibooks "Inside DVD-Video/IFO Files") are the reference — read those before touching any `read_*` function or offset.
 - Broken-DVD tolerance is deliberate: `read_vts_title_program_chain_table` already contains a fallback for corrupt PGC table offsets (reads at the current position when `offset >= end_address`). When adding new parsing, keep the same "detect the violation and work around it" approach.
 - VOB files are matched with `VTS_%02d_[1-9].VOB`; the `_0.VOB` menu VOB is intentionally skipped.
+- Each title is ripped by `rip_one_title($title)`, wrapped in `eval {}` in `read_vmg`: if a title can't be read it logs a warning ("Skipping title …") and moves on to the next instead of aborting the run. `rip_one_title` cleans up (reaps ffmpeg, unlinks a truncated output) before re-throwing.
+- `read_vob_sector` seeks to the sector's byte offset within the selected VOB before reading, so each call returns the exact sector independent of prior reads. Per-sector seek logging appears at verbosity level ≥ 2.
 - Chapters are passed to ffmpeg as an FFMETADATA1 file (`;FFMETADATA1` + `[CHAPTER]` blocks) written to `/tmp/dvd.$$.chapters.txt`, mapped via `-map_chapters 1`.
 - Current encode profile: libsvtav1 (crf 32, preset 5, yuv420p10le, GOP 240), Opus 160k audio (or `-c:a copy` when mediainfo reports >2 channels), subtitles copied, optional `yadif=1:-1:0` deinterlacing. `--simple-mapping` switches from `-map 0:v -map 0:a? -map 0:s?` to a plain `-map 0`.
 - `read_vobu_address_table` and `min()` are dead code (defined but never called).
@@ -36,3 +39,4 @@ perl read_dvd.pl [options] /path/to/dvd/
 - All functions and variables should have helpfully descriptive names.
 - Commented-out debug code is intentional: it is kept so it can be easily re-enabled, and must not be deleted.
 - Multi-byte IFO fields are read with `read_uint64_be` / `read_uint32_be` / `read_uint16_be` / `read_uint8` — all big-endian, as the DVD spec mandates.
+- The top-of-file `*Type` declarations (Type::Tiny `Dict`s, e.g. `$VtsType`, `$RipTitleType`) are the canonical documentation of the script's data structures. They describe shape but are **not enforced** at runtime. Keep them in sync whenever a structure changes.
