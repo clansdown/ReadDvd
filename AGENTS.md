@@ -34,3 +34,5 @@ perl read_dvd.pl [options] /path/to/dvd/
 - Comments should explain the *purpose* of the code, not restate what it does.
 - Every function should have a comment header explaining its purpose within the code and when to use it.
 - All functions and variables should have helpfully descriptive names.
+- Commented-out debug code is intentional: it is kept so it can be easily re-enabled, and must not be deleted.
+- Multi-byte IFO fields are read with `read_uint64_be` / `read_uint32_be` / `read_uint16_be` / `read_uint8` — all big-endian, as the DVD spec mandates.

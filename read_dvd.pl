@@ -18,6 +18,7 @@ use Devel::StackTrace;
 use Fcntl 'SEEK_CUR';
 use feature 'signatures';
 use strict;
+use warnings;
 
 my ($ForceDeinterlace, $SimpleMapping, $Name, $DEST, $Help, $MinRuntimeSeconds, $Debug);
 $DEST=".";
@@ -62,29 +63,32 @@ if($Name eq "DVD" && $BASEDIR =~ m{([^/]+)(?:/VIDEO_TS/?)?$}) {
 read_vmg();
 
 ################
-# Reads the VMG IFO file
+# Main entrypoint. Reads the DVD's Video Manager (VMG) descriptor from
+# VIDEO_TS.IFO (or .BUP), parses each Video Title Set (VTS), computes title
+# playtimes, picks the titles to rip, and transcodes them to AV1 MKV.
+# Called once at startup; dies on a missing or malformed descriptor.
 sub read_vmg {
     my $fh;
     open($fh, "<", "$BASEDIR/VIDEO_TS/VIDEO_TS.IFO") or open($fh, "<", "$BASEDIR/VIDEO_TS/VIDEO_TS.BUP") or die "Unable to open the main descriptor: $!\n";
     my $dvdvideo_vmg;
     sysread($fh, $dvdvideo_vmg, 12) == 12 or die "short read!\n";
     die "Directory does not contain a valid DVD descriptor" if $dvdvideo_vmg ne "DVDVIDEO-VMG";
-    my $last_vmg_sector = read_int($fh);
+    my $last_vmg_sector = read_uint32_be($fh);
     sysseek($fh, 0x1c, 0);
-    my $last_ifo_sector = read_int($fh);
+    my $last_ifo_sector = read_uint32_be($fh);
     sysseek($fh, 0x20, 0);
-    my $version_number = read_short($fh);
-    my $vmg_category = read_int($fh);
-    my $volume_count = read_short($fh);
-    my $volume_number = read_short($fh);
-    my $side_id = read_byte($fh);
+    my $version_number = read_uint16_be($fh);
+    my $vmg_category = read_uint32_be($fh);
+    my $volume_count = read_uint16_be($fh);
+    my $volume_number = read_uint16_be($fh);
+    my $side_id = read_uint8($fh);
     sysseek($fh, 0x3E, 0);
-    my $title_set_count = read_short($fh);
+    my $title_set_count = read_uint16_be($fh);
     my $provider_id = read_bytes($fh, 32);
     $provider_id =~ s/[\x00-\x08\x0B\x0C\x0E-\x1F]//g;
-    my $vmg_pos = read_long($fh);
+    my $vmg_pos = read_uint64_be($fh);
     sysseek($fh, 0x84, 0);
-    my $first_chain_address = read_int($fh);
+    my $first_chain_address = read_uint32_be($fh);
 
     print qq{The DVD is provided by "$provider_id"\n};
     print "The DVD contains $title_set_count titles.\n";
@@ -92,8 +96,8 @@ sub read_vmg {
     # print "First chain is at: $first_chain_address\n";
 
     sysseek($fh, 0xC0, 0);
-    my $menu_vob_start = read_int($fh);
-    my $title_table_start = read_int($fh);
+    my $menu_vob_start = read_uint32_be($fh);
+    my $title_table_start = read_uint32_be($fh);
     # print "title table start: $title_table_start\n";
     my $titles = read_vmg_title_table($fh, $title_table_start*2048);
     
@@ -150,7 +154,7 @@ sub read_vmg {
     # Rip the titles #
     ##################
     foreach my $title (sort {int($b->{playtime}/180) <=> int($a->{playtime}/180) || $a->{index} <=> $b->{index}} @titles_to_rip) {
-        printf("Saving title $title->{index}.\n");
+        print "Saving title $title->{index}.\n";
 
         # TODO: make it an option to just extract rather than to pipe to ffmpeg
         # open(my $out, ">", "title.$title->{index}.mpv") or die "Unable to open video file.$!\n";
@@ -170,8 +174,8 @@ sub read_vmg {
 
         
         # TODO: we need to run mediainfo on the VOB file that contains the first cells in the program and use that to determine features
-        my $v = get_first_vob_file($title, $vobs);
-        my $info = `mediainfo "$v"`;
+        my $vob_file = get_first_vob_file($title, $vobs);
+        my $info = `mediainfo "$vob_file"`;
 
         # Find out if it's interlaced
         my @yadif=();
@@ -213,7 +217,7 @@ sub read_vmg {
             my $pid = open(my $out, "|-", "ffmpeg", "-loglevel", "30", "-stats", "-i", "-", "-i", $chapter_file, @yadif, @mapping, "-map_chapters", "1", "-c:v", "libsvtav1", "-b:v", "0", "-preset", "5", "-crf", "32", "-g", "240", "-pix_fmt", "yuv420p10le", "-svtav1-params", "tune=0", @audio, "-c:s", "copy", "${DEST}/${name}.av1.mkv" );
             if(!defined($pid)) {
                 unlink($chapter_file);
-                die "Unable to open ffmpeg! ($!\)\n";
+                die "Unable to open ffmpeg! ($!)\n";
             }
 
             
@@ -239,7 +243,10 @@ sub read_vmg {
 }
 
 ####
-# Writes the chapter file
+# Writes an ffmpeg FFMETADATA1 chapter file for a title, consumed via
+# -map_chapters 1. One [CHAPTER] block per program (PTT), with START/END
+# times in milliseconds derived from cell playtimes.
+# Call before the ffmpeg encode for each title being ripped.
 sub write_chapter_file($title, $chapter_file) {
     # print "write_chapter_file($title, $chapter_file)\n";
 
@@ -265,7 +272,9 @@ sub write_chapter_file($title, $chapter_file) {
 }
 
 ####
-#
+# Returns the cell a program (PTT) starts at, by following the program
+# chain's program map from the PTT's {program_chain, program} entry.
+# Used when writing chapters and when walking a title's programs.
 sub get_program_chain_cell($vts, $chain_index, $program_index) {
     # print "get_program_chain_cell($vts, $chain_index, $program_index)\n";
     my $chain = $vts->{program_chains}->[$chain_index-1]->{chain};
@@ -274,7 +283,10 @@ sub get_program_chain_cell($vts, $chain_index, $program_index) {
 }
 
 ####
-# Gets the filename of the first VOB file in the title (with path)
+# Returns the path of the VOB file containing a title's first cell, by
+# translating the cell's start sector into a VOB-relative offset. Falls
+# back to the last VOB in the list if the offset runs past all of them.
+# Used to pick a file for mediainfo probing.
 sub get_first_vob_file($title, $vobs) {
     my $cell = $title->{cells}->[0];
     my $sector = $cell->{start};
@@ -294,7 +306,9 @@ sub get_first_vob_file($title, $vobs) {
 }
 
 ####
-# Read a sector from a vob and return it
+# Reads a single 2048-byte VOB sector, translating the title-relative
+# sector number into the right VOB file and offset. Dies on a short read.
+# Used by the ripping loop to stream cells to ffmpeg.
 sub read_vob_sector($vobs, $sector) {
     # print "read_vob_sector($vobs, $sector)\n";
     # print Dumper($vobs);
@@ -358,10 +372,12 @@ sub find_all_cells($vts, $title) {
 }
 
 ####
-# Calculates the playtime for a title
+# Computes a title's total playtime in seconds by summing the playtime of
+# the cell each of its programs (PTTs) starts at.
+# Used to filter titles by --min-runtime.
 sub calculate_title_playtime($vts, $title) {
     # print Dumper($title);
-    my $playtime;
+    my $playtime = 0;
 
     foreach my $ptt (@{$title->{ptts}}) {
         # print Dumper($ptt);
@@ -373,13 +389,15 @@ sub calculate_title_playtime($vts, $title) {
 }
 
 ####
-# Reads the VMG title table 
+# Reads the VMG title table (VMG_PTT): the disc's top-level list of titles,
+# each with its VTS number, title-within-VTS number, chapter count, and
+# start sector. Called by read_vmg.
 sub read_vmg_title_table($fh, $addr) {
     sysseek($fh, $addr, 0) or die "Unable to seek to position: $!\n";
 
-    my $title_count = read_short($fh);
-    my $reserved = read_short($fh);
-    my $end_address = read_int($fh);
+    my $title_count = read_uint16_be($fh);
+    my $reserved = read_uint16_be($fh);
+    my $end_address = read_uint32_be($fh);
 
     # print "title count: $title_count\n";
 
@@ -388,13 +406,13 @@ sub read_vmg_title_table($fh, $addr) {
         my $title = {};
         push(@$titles, $title);
         $title->{index} = $i+1;
-        $title->{type} = read_byte($fh);
-        $title->{angle_count} = read_byte($fh);
-        $title->{chapter_count} = read_short($fh);
-        $title->{parental_management_mask} = read_short($fh);
-        $title->{video_title_set_number} = read_byte($fh);
-        $title->{title_in_vts} = read_byte($fh);
-        $title->{start_sector} = read_int($fh);
+        $title->{type} = read_uint8($fh);
+        $title->{angle_count} = read_uint8($fh);
+        $title->{chapter_count} = read_uint16_be($fh);
+        $title->{parental_management_mask} = read_uint16_be($fh);
+        $title->{video_title_set_number} = read_uint8($fh);
+        $title->{title_in_vts} = read_uint8($fh);
+        $title->{start_sector} = read_uint32_be($fh);
 
         # print Dumper($title);
         
@@ -420,7 +438,9 @@ sub seek_abs($fh, $address) {
 }
 
 ################
-# reads a VTS .IFO file
+# Reads one Video Title Set (VTS_xx_0.IFO, or its .BUP backup) and returns
+# a hashref with that VTS's title table, program chain table, and cell
+# address table. Called by read_vmg for each VTS on the disc.
 sub read_vts($index) {
     # print "Reading vts $index\n";
 
@@ -433,11 +453,11 @@ sub read_vts($index) {
         die "VTS $index is not a valid VTS index.\n";
     }
     seek_abs($fh, 0xC8);
-    my $title_pointer = read_int($fh)*2048;
-    my $title_program_chain_table_pointer = read_int($fh)*2048;
+    my $title_pointer = read_uint32_be($fh)*2048;
+    my $title_program_chain_table_pointer = read_uint32_be($fh)*2048;
     seek_abs($fh, 0xE0);
-    my $title_cell_address_table_pointer = read_int($fh)*2048;
-    my $title_vobu_address_map_pointer = read_int($fh)*2048;
+    my $title_cell_address_table_pointer = read_uint32_be($fh)*2048;
+    my $title_vobu_address_map_pointer = read_uint32_be($fh)*2048;
 
     # print "title pointer: $title_pointer\n";
     # print "title program chain pointer: $title_program_chain_table_pointer\n";
@@ -466,41 +486,45 @@ sub read_vts($index) {
 }
 
 ##############
-# Reads a top level cell address tabe
+# Reads the VTS cell address table (VTS_C_ADT): the top-level list of cells
+# with their vob_id/cell_id and start/end sectors. Currently parsed but
+# not consumed downstream.
 sub read_cell_address_table($fh, $address) {
     seek_abs($fh, $address);
     my @cells;
 
-    my $vob_id_count = read_short($fh);
-    my $reserved = read_short($fh);
-    my $end_address = read_int($fh);
+    my $vob_id_count = read_uint16_be($fh);
+    my $reserved = read_uint16_be($fh);
+    my $end_address = read_uint32_be($fh);
     my $cell_count = ($end_address-8)/12;
 
     for(my $i = 0; $i < $cell_count; $i++) {
         my $cell = {};
         push(@cells, $cell);
-        $cell->{vob_id} = read_short($fh);
-        $cell->{cell_id} = read_byte($fh);
-        my $reserved = read_byte($fh);
-        $cell->{start_sector} = read_int($fh);
-        $cell->{end_sector} = read_int($fh);
+        $cell->{vob_id} = read_uint16_be($fh);
+        $cell->{cell_id} = read_uint8($fh);
+        my $reserved = read_uint8($fh);
+        $cell->{start_sector} = read_uint32_be($fh);
+        $cell->{end_sector} = read_uint32_be($fh);
     }
     
     return @cells;
 }
 
 ##############
-# Reads the VOBU address table
+# Reads the VTS VOBU address map (VTS_VOBU_ADMAP): one 4-byte sector
+# address per VOBU. Currently unused; the call site in read_vts is
+# commented out, kept for debugging and future work.
 sub read_vobu_address_table($fh, $address) {
     seek_abs($fh, $address);
     # print "START ADDRESS: $address\n";
-    my $end_address = read_int($fh);
+    my $end_address = read_uint32_be($fh);
     # print "END ADDRESS: $end_address\n";
     my $count = ($end_address - $address+1) / 4;
     # print "COUNT: $count\n";
     my @vobus;
     for(my $i = 0; $i < $count; $i++) {
-        push(@vobus, read_int($fh));
+        push(@vobus, read_uint32_be($fh));
     }
 
     return @vobus;
@@ -508,13 +532,15 @@ sub read_vobu_address_table($fh, $address) {
 
 
 ################
-# Reads a VTS title table
+# Reads a VTS title table: per-title PTT (part-of-title) offsets, the
+# derived PTT counts, and each title's list of {program_chain, program}
+# entries. Called by read_vts.
 sub read_vts_title_table($fh, $address) {
     my @titles;
     seek_abs($fh, $address);
-    my $title_count = read_short($fh);
-    my $reserved = read_short($fh);
-    my $ptt_end_address = read_int($fh);
+    my $title_count = read_uint16_be($fh);
+    my $reserved = read_uint16_be($fh);
+    my $ptt_end_address = read_uint32_be($fh);
 
     # print "title count: $title_count\n";
 
@@ -523,7 +549,7 @@ sub read_vts_title_table($fh, $address) {
         my $title = {};
         push(@titles, $title);
         $title->{index} = $title_index;
-        $title->{offset} = read_int($fh);
+        $title->{offset} = read_uint32_be($fh);
     }
 
     # Step 2: calculate the counts
@@ -540,7 +566,7 @@ sub read_vts_title_table($fh, $address) {
         seek_abs($fh, $address + $title->{offset});
         $title->{ptts} = [];
         for(my $i = 0; $i < $title->{ptt_count}; $i++) {
-            push(@{$title->{ptts}}, {program_chain => read_short($fh), program => read_short($fh) });
+            push(@{$title->{ptts}}, {program_chain => read_uint16_be($fh), program => read_uint16_be($fh) });
         }
     }
 
@@ -556,9 +582,9 @@ sub read_vts_title_program_chain_table($fh, $address) {
     # printf("reading vts at %x\n", $address);
     
     # Header
-    my $program_chain_count = read_short($fh);
-    my $reserved = read_short($fh);
-    my $end_address = read_int($fh);
+    my $program_chain_count = read_uint16_be($fh);
+    my $reserved = read_uint16_be($fh);
+    my $end_address = read_uint32_be($fh);
     # print "program chain count: $program_chain_count\n";
 
     # Read the category and offsets
@@ -566,8 +592,8 @@ sub read_vts_title_program_chain_table($fh, $address) {
     foreach my $i (1..$program_chain_count) {
         my $chain = {index => $i};
         push(@chains, $chain);
-        $chain->{category} = read_int($fh);
-        $chain->{offset} = read_int($fh);
+        $chain->{category} = read_uint32_be($fh);
+        $chain->{offset} = read_uint32_be($fh);
     }
 
     # Read the chains
@@ -586,14 +612,19 @@ sub read_vts_title_program_chain_table($fh, $address) {
     return @chains;
 }
 
+####
+# Reads one program chain (PGC) at a byte address within a VTS PGC table:
+# its program map, cell playback table, and cell position table. Returns a
+# chain hashref whose cells drive title selection and ripping.
+# Called by read_vts_title_program_chain_table.
 sub read_chain($fh, $addr) {
     seek_abs($fh, $addr+2);
     # print "\tread_chain(fh, $addr)\n";
 
     my $chain = {};
-    my $program_count = read_byte($fh);
+    my $program_count = read_uint8($fh);
     $chain->{program_count} = $program_count;
-    my $cell_count = read_byte($fh);
+    my $cell_count = read_uint8($fh);
     $chain->{cell_count} = $cell_count;
     # print "\tprogram count: $program_count\n";
     # print "\tcell count: $cell_count\n";
@@ -602,23 +633,23 @@ sub read_chain($fh, $addr) {
 
 
     seek_abs($fh, $addr+0x9c);
-    my $next_pgcn = read_short($fh);
-    my $previous_pgcn = read_short($fh);
-    my $group_pgcn = read_short($fh);
-    my $still_time = read_byte($fh);
-    my $playback_mode = read_byte($fh);
+    my $next_pgcn = read_uint16_be($fh);
+    my $previous_pgcn = read_uint16_be($fh);
+    my $group_pgcn = read_uint16_be($fh);
+    my $still_time = read_uint8($fh);
+    my $playback_mode = read_uint8($fh);
     seek_abs($fh, $addr+0xE4);
-    my $commands_offset = read_short($fh);
-    my $program_map_offset = read_short($fh);
-    my $cell_playback_table_offset = read_short($fh);
-    my $cell_position_table_offset = read_short($fh);
+    my $commands_offset = read_uint16_be($fh);
+    my $program_map_offset = read_uint16_be($fh);
+    my $cell_playback_table_offset = read_uint16_be($fh);
+    my $cell_position_table_offset = read_uint16_be($fh);
 
     # Read the Program Map
     my $programs = [];
     $chain->{programs} = $programs;
     seek_abs($fh, $addr + $program_map_offset);
     for(my $i = 0; $i < $program_count; $i++) {
-        push(@$programs, read_byte($fh));
+        push(@$programs, read_uint8($fh));
     }
 
     # Read the Cell playback table
@@ -628,34 +659,38 @@ sub read_chain($fh, $addr) {
     for(my $i = 0; $i < $cell_count; $i++) {
         my $cell = {};
         push(@$cells, $cell);
-        $cell->{flags} = read_byte($fh);
-        $cell->{restricted} = ((read_byte($fh) >> 6) & 0x01);
-        $cell->{still_time} = read_byte($fh);
-        $cell->{command_number} = read_byte($fh);
+        $cell->{flags} = read_uint8($fh);
+        $cell->{restricted} = ((read_uint8($fh) >> 6) & 0x01);
+        $cell->{still_time} = read_uint8($fh);
+        $cell->{command_number} = read_uint8($fh);
         read_bcd_time($fh, $cell);
-        $cell->{vobu_start_sector} = read_int($fh);
-        $cell->{ilvu_end_sector} = read_int($fh);
-        $cell->{last_vobu_start_sector} = read_int($fh);
-        $cell->{last_vobu_end_sector} = read_int($fh);
+        $cell->{vobu_start_sector} = read_uint32_be($fh);
+        $cell->{ilvu_end_sector} = read_uint32_be($fh);
+        $cell->{last_vobu_start_sector} = read_uint32_be($fh);
+        $cell->{last_vobu_end_sector} = read_uint32_be($fh);
     }
 
     # Read the cell position table
     seek_abs($fh, $addr + $cell_position_table_offset);
     for(my $i = 0; $i < $cell_count; $i++) {
         my $cell = $cells->[$i];
-        $cell->{vob_id} = read_short($fh);
-        my $reserved = read_byte($fh);
-        my $cell->{id} = read_byte($fh);
+        $cell->{vob_id} = read_uint16_be($fh);
+        my $reserved = read_uint8($fh);
+        $cell->{id} = read_uint8($fh);
     }
 
     return $chain;
 }
 
+####
+# Reads four BCD bytes (hours/minutes/seconds/frames) and stores the
+# decoded playtime in seconds and a formatted playtime_text on the given
+# hashref. Called while reading program chains and cells.
 sub read_bcd_time($fh, $hash) {
-    my $playback_h_bcd = read_byte($fh);
-    my $playback_m_bcd = read_byte($fh);
-    my $playback_s_bcd = read_byte($fh);
-    my $playback_f_bcd = read_byte($fh);
+    my $playback_h_bcd = read_uint8($fh);
+    my $playback_m_bcd = read_uint8($fh);
+    my $playback_s_bcd = read_uint8($fh);
+    my $playback_f_bcd = read_uint8($fh);
 
     my $hours = 10*($playback_h_bcd >> 4) + ($playback_h_bcd & 0xf);
     my $minutes = 10*($playback_m_bcd >> 4) + ($playback_m_bcd & 0xf);
@@ -665,6 +700,10 @@ sub read_bcd_time($fh, $hash) {
     $hash->{playtime_text} = sprintf("%02d:%02d:%02d:%02d", $hours, $minutes, $sec, $frames);
 }
 
+####
+# Reads exactly $count raw bytes and returns them as a byte string, dying
+# on a short read. Used for magic strings (e.g. "DVDVIDEO-VMG") and
+# variable-length fields such as the provider ID.
 sub read_bytes {
     my ($fh, $count) = @_;
     my $val;
@@ -674,7 +713,11 @@ sub read_bytes {
     return $val;
 }
 
-sub read_long {
+####
+# Reads an 8-byte unsigned integer, big-endian (network byte order), which
+# is the byte order the DVD spec mandates. Dies with a stack trace on a
+# short read.
+sub read_uint64_be {
     my ($fh) = @_;
     my $val;
     if(sysread($fh, $val, 8) != 8) {
@@ -687,7 +730,11 @@ sub read_long {
 }
 
 
-sub read_int {
+####
+# Reads a 4-byte unsigned integer, big-endian (network byte order), which
+# is the byte order the DVD spec mandates. Dies with a stack trace on a
+# short read.
+sub read_uint32_be {
     my ($fh) = @_;
     my $val;
     if(sysread($fh, $val, 4) != 4) {
@@ -700,7 +747,11 @@ sub read_int {
 }
 
 
-sub read_short {
+####
+# Reads a 2-byte unsigned integer, big-endian (network byte order), which
+# is the byte order the DVD spec mandates. Dies with a stack trace on a
+# short read.
+sub read_uint16_be {
     my ($fh) = @_;
     my $val;
     if(sysread($fh, $val, 2) != 2) {
@@ -712,7 +763,9 @@ sub read_short {
     return $ret;
 }
 
-sub read_byte {
+####
+# Reads a single unsigned byte. Dies with a stack trace on a short read.
+sub read_uint8 {
     my ($fh) = @_;
     my $val;
     if(sysread($fh, $val, 1) != 1) {
@@ -724,10 +777,17 @@ sub read_byte {
     return $ret;
 }
 
+####
+# Returns the larger of two numbers. Used when indexing cells by program
+# index: PGC program/cell numbers are 1-based, so arrays are indexed with
+# max(0, index-1).
 sub max($a, $b) {
     return $a > $b ? $a : $b;
 }
 
+####
+# Returns the smaller of two numbers. Currently unused, kept for symmetry
+# with max.
 sub min($a, $b) {
     return $a > $b ? $b : $a;
 }
